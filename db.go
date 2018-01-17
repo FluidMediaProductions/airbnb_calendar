@@ -5,14 +5,24 @@ import (
 	"database/sql"
 	_ "github.com/lib/pq"
 	"github.com/lestrrat/go-ical"
+	"fmt"
 )
 
 type pgDb struct {
 	dbConn *sql.DB
 }
 
-func initDb() (*pgDb, error) {
-	if dbConn, err := sql.Open("postgres", "user=postgres password=4TdBwvaXnpXxTzGMYQA3 host=127.0.0.1 dbname=airbnb_cal sslmode=disable"); err != nil {
+type dbConfig struct {
+	dbHost string
+	dbName string
+	dbUser string
+	dbPass string
+}
+
+func initDb(config *dbConfig) (*pgDb, error) {
+	connectString := fmt.Sprintf("user=%s password=%s host=%s dbname=%s",
+		config.dbUser, config.dbPass, config.dbHost, config.dbName)
+	if dbConn, err := sql.Open("postgres", connectString); err != nil {
 		return nil, err
 	} else {
 		p := &pgDb{dbConn: dbConn}
