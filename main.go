@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	_ "github.com/lib/pq"
 	"time"
+	"github.com/gorilla/mux"
 )
 
 const iCalDateFormat = "20060102"
@@ -14,6 +15,8 @@ const iCalDateFormat = "20060102"
 type pgDb struct {
 	dbConn *sql.DB
 }
+
+var db *pgDb
 
 func initDb() (*pgDb, error) {
 	if dbConn, err := sql.Open("postgres", "user=postgres password=4TdBwvaXnpXxTzGMYQA3 host=127.0.0.1 dbname=airbnb_cal sslmode=disable"); err != nil {
@@ -46,55 +49,113 @@ func (p *pgDb) createTablesIfNotExist() error {
 func (p *pgDb) insertOrUpdateEvent(uid *ical.Property, start *ical.Property, end *ical.Property, summary *ical.Property) error {
 	lookupSql := `
         SELECT uid, summary, dtstart, dtend FROM events
-        WHERE uid = $1
+        WHERE dtstart = $1 AND dtend = $2
     `
     exists := true
-    var oldSummary string
+    var oldSummary, oldUid string
     var oldStart, oldEnd time.Time
-    r := p.dbConn.QueryRow(lookupSql, uid.RawValue())
-    err := r.Scan(nil, &oldSummary, &oldStart, &oldEnd)
+	newStart, err := time.Parse(iCalDateFormat, start.RawValue())
+	if err != nil {
+		return err
+	}
+	newEnd, err := time.Parse(iCalDateFormat, end.RawValue())
+	if err != nil {
+		return err
+	}
+    r := p.dbConn.QueryRow(lookupSql, newStart, newEnd)
+    err = r.Scan(&oldUid, &oldSummary, &oldStart, &oldEnd)
     if err == sql.ErrNoRows {
     	exists = false
 	} else if err != nil {
 		return err
 	}
-	var newStart, newEnd time.Time
-	newStart, err = time.Parse(iCalDateFormat, start.RawValue())
-	if err != nil {
-		return err
-	}
-	newEnd, err = time.Parse(iCalDateFormat, end.RawValue())
-	if err != nil {
-		return err
-	}
 	if !exists {
 		insertSql := `
-            INSERT INTO events
-            (uid, dtstart, dtend, summary)
-            VALUES ($1, $2, $3, $4)
+			INSERT INTO events
+			(uid, dtstart, dtend, summary)
+			VALUES ($1, $2, $3, $4)
         `
-        _, err := p.dbConn.Exec(insertSql, uid.RawValue(), newStart, newEnd, summary.RawValue())
-        if err != nil {
-        	return err
+		// Run the insert
+		_, err := p.dbConn.Exec(insertSql, uid.RawValue(), newStart, newEnd, summary.RawValue())
+		if err != nil {
+			return err
 		}
 	} else {
 		if newStart != oldStart || newEnd != oldEnd || summary.RawValue() != oldSummary {
 			updateSql := `
-                UPDATE events
-                SET dtstart = $2, dtend = $3, summary = $4
-                WHERE uid = $1
-            `
-            _, err := p.dbConn.Exec(updateSql, uid.RawValue(), newStart, newEnd, summary.RawValue())
-            if err != nil {
-            	return err
+				UPDATE events
+				SET dtstart = $3, dtend = $4, summary = $5, uid = $2
+				WHERE uid = $1
+        	`
+			// Run the update
+			_, err := p.dbConn.Exec(updateSql, oldUid, uid.RawValue(), newStart, newEnd, summary.RawValue())
+			if err != nil {
+				return err
 			}
 		}
 	}
     return nil
 }
 
+func (p *pgDb) getEvents() (*sql.Rows, error) {
+	lookupSql := `
+        SELECT uid, summary, dtstart, dtend FROM events
+  `
+	r, err := p.dbConn.Query(lookupSql)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func handleCalendar(w http.ResponseWriter, r *http.Request) {
+	// Create calendar
+	c := ical.New()
+	// Get rows
+	rows, err := db.getEvents()
+	if err != nil {
+		// Send http error if we cant load events
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	// Iterare over rows
+	for rows.Next() {
+		// Setup variables for each row
+		var uid, summary string
+		var start, end time.Time
+		// Pull row data out
+		err := rows.Scan(&uid, &summary, &start, &end)
+		if err != nil {
+			// Send error
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		// Create new event
+		e := ical.NewEvent()
+		// Convert times to text
+		var startTxt, endTxt string
+		startTxt = start.Format(iCalDateFormat)
+		endTxt = end.Format(iCalDateFormat)
+		// Add data
+		e.AddProperty("uid", uid)
+		e.AddProperty("summary", summary)
+		e.AddProperty("dtstart", startTxt)
+		e.AddProperty("dtend", endTxt)
+		// Ad event to calendar
+		c.AddEntry(e)
+	}
+	if err := rows.Err(); err != nil {
+		// Send error
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	// Write out calendar
+	ical.NewEncoder(w).Encode(c)
+}
+
 func main() {
-	db, err := initDb()
+	var err error
+	db, err = initDb()
 	if err != nil {
 		log.Fatalf("Error initializing database: %v\n", err)
 	}
@@ -130,4 +191,11 @@ func main() {
 			}
 		}
 	}
+
+	// Create router
+	router := mux.NewRouter().StrictSlash(true)
+	// Only accept GET at /calendar/ical.ics requests
+	router.Methods("GET").Path("/calendar/ical.ics").HandlerFunc(handleCalendar)
+	// Start the server and if it exits log the error
+	log.Fatal(http.ListenAndServe(":8080", router))
 }
